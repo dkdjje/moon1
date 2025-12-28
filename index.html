@@ -1,0 +1,767 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Magical Sakura - Glowing Cat</title>
+    <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@400;700&display=swap" rel="stylesheet">
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
+                "@mediapipe/tasks-vision": "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/+esm"
+            }
+        }
+    </script>
+    <style>
+        body {
+            margin: 0;
+            background: radial-gradient(circle at 30% 20%, #1a0b2e 0%, #050208 60%, #000000 100%);
+            color: #ffd7e6;
+            font-family: 'Times New Roman', serif;
+            overflow: hidden;
+            user-select: none;
+        }
+
+        #ui-layer {
+            position: absolute;
+            top: 0; left: 0; width: 100%; height: 100%;
+            pointer-events: none;
+            z-index: 10;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            transition: opacity 0.5s ease;
+        }
+
+        #loader {
+            position: fixed;
+            top: 0; left: 0; width: 100%; height: 100%;
+            background: #000000;
+            display: flex; flex-direction: column; justify-content: center; align-items: center;
+            z-index: 200;
+            transition: opacity 0.5s ease;
+        }
+
+        .spinner {
+            width: 50px; height: 50px;
+            border: 2px solid rgba(255, 255, 255, 0.1);
+            border-top: 2px solid #ffc0cb;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        #video-preview {
+            position: fixed;
+            bottom: 20px; right: 20px;
+            width: 140px; height: 105px;
+            transform: scaleX(-1);
+            opacity: 0.1; 
+            pointer-events: none;
+            border-radius: 8px;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="loader">
+        <div class="spinner"></div>
+    </div>
+
+    <div id="ui-layer"></div>
+
+    <video id="video-preview" autoplay playsinline></video>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+        import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+        import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+        import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+        import { FilesetResolver, HandLandmarker } from '@mediapipe/tasks-vision';
+
+        const CONFIG = {
+            particleCount: 80000, 
+            treeOffsetX: 35 
+        };
+
+        const STATE = {
+            mode: 'TREE', 
+            transition: 0.0,
+            targetTransition: 0.0,
+            rotation: new THREE.Vector2(),
+            targetRotation: new THREE.Vector2()
+        };
+
+        const COLORS = {
+            sakuraPink: 0xffb7c5, 
+            sakuraDeep: 0xff9eb5,
+            sakuraWhite: 0xffeef5,
+            
+            brownDark: 0x1a0f0a, 
+            brownLight: 0x3e2723, 
+            grassDark: 0x020a02, 
+            grassLight: 0x0f2f1f,
+            
+            moonWhite: 0xfffff0,
+            moonGold: 0xffddaa,
+            moonBlue: 0xcceeff
+        };
+
+        class App {
+            constructor() {
+                this.initThree();
+                this.initPostProcessing();
+                this.createEnvironment(); 
+                this.createBackgroundMoon(); 
+                this.createGpuTree(); 
+                this.createSwingAndCat(); 
+                this.createFireflies();
+                
+                // === 修复 Edge 加载问题的核心逻辑 ===
+                const hideLoader = () => {
+                    const loader = document.getElementById('loader');
+                    if(loader && loader.style.opacity !== '0') {
+                        loader.style.opacity = '0';
+                        setTimeout(() => loader?.remove(), 800);
+                    }
+                };
+
+                // 尝试初始化 MediaPipe
+                this.initMediaPipe()
+                    .then(() => {
+                        console.log("MediaPipe loaded");
+                        hideLoader();
+                    })
+                    .catch((e) => {
+                        console.warn("MediaPipe failed (Network/Camera issue), skipping...", e);
+                        hideLoader(); // 即使失败也进入场景
+                    });
+
+                // 强制兜底：3秒后无论如何都进入场景，防止无限加载
+                setTimeout(() => {
+                    console.log("Force loading scene...");
+                    hideLoader();
+                }, 3000);
+
+                this.bindEvents();
+                this.animate();
+            }
+
+            initThree() {
+                this.scene = new THREE.Scene();
+                this.scene.fog = new THREE.FogExp2(0x050208, 0.002);
+                
+                this.mainGroup = new THREE.Group();
+                this.scene.add(this.mainGroup);
+                
+                this.camera = new THREE.PerspectiveCamera(40, window.innerWidth / window.innerHeight, 1, 2000);
+                this.camera.position.set(0, 15, 170); 
+                this.camera.lookAt(5, 5, 0);
+
+                this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, powerPreference: "high-performance" });
+                this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2.0));
+                this.renderer.setSize(window.innerWidth, window.innerHeight);
+                this.renderer.toneMapping = THREE.ReinhardToneMapping;
+                this.renderer.toneMappingExposure = 1.8; 
+                document.body.appendChild(this.renderer.domElement);
+                
+                this.scene.environment = new THREE.PMREMGenerator(this.renderer).fromScene(new RoomEnvironment(), 0.04).texture;
+                
+                const ambientLight = new THREE.AmbientLight(0x404050, 0.6);
+                this.scene.add(ambientLight);
+                
+                const dirLight = new THREE.DirectionalLight(0xffd7e6, 0.4);
+                dirLight.position.set(-20, 30, 20);
+                this.scene.add(dirLight);
+            }
+
+            initPostProcessing() {
+                this.composer = new EffectComposer(this.renderer);
+                this.composer.addPass(new RenderPass(this.scene, this.camera));
+                this.composer.addPass(new UnrealBloomPass(new THREE.Vector2(window.innerWidth, window.innerHeight), 0.8, 0.3, 0.8));
+            }
+
+            async initMediaPipe() {
+                try {
+                    const vision = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/wasm");
+                    this.handLandmarker = await HandLandmarker.createFromOptions(vision, {
+                        baseOptions: { modelAssetPath: `https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task`, delegate: "GPU" },
+                        runningMode: "VIDEO", numHands: 1
+                    });
+                    const v = document.getElementById('video-preview');
+                    // 尝试获取摄像头，如果失败也不要阻塞
+                    try {
+                        const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+                        v.srcObject = stream;
+                    } catch (err) {
+                        console.warn("Camera access denied or unavailable", err);
+                    }
+                } catch (e) { 
+                    console.warn("Gesture Control Unavailable (Network/WASM error)"); 
+                    // 不抛出错误，允许程序继续运行
+                }
+            }
+
+            createBackgroundMoon() {
+                const moonGeo = new THREE.SphereGeometry(12, 64, 64);
+                const moonMat = new THREE.MeshBasicMaterial({ color: COLORS.moonGold }); 
+                this.bgMoon = new THREE.Mesh(moonGeo, moonMat);
+                this.bgMoon.position.set(-80, 60, -100); 
+                this.scene.add(this.bgMoon);
+
+                this.moonLight = new THREE.PointLight(COLORS.moonGold, 0.3, 400);
+                this.moonLight.position.copy(this.bgMoon.position);
+                this.scene.add(this.moonLight);
+            }
+
+            createEnvironment() {
+                const petalGeo = new THREE.BufferGeometry();
+                const pos = [];
+                const sizes = [];
+                const speeds = [];
+                for(let i=0; i<8000; i++) { 
+                    pos.push((Math.random()-0.5)*800, Math.random()*400 - 50, (Math.random()-0.5)*400);
+                    sizes.push(Math.random() * 0.5 + 0.3);
+                    speeds.push(Math.random() * 0.5 + 0.5);
+                }
+                petalGeo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+                petalGeo.setAttribute('size', new THREE.Float32BufferAttribute(sizes, 1));
+                petalGeo.setAttribute('speed', new THREE.Float32BufferAttribute(speeds, 1));
+                
+                const petalMat = new THREE.ShaderMaterial({
+                    uniforms: {
+                        color: { value: new THREE.Color(COLORS.sakuraPink) },
+                        uTime: { value: 0 },
+                        uOpacity: { value: 1.0 }
+                    },
+                    vertexShader: `
+                        attribute float size;
+                        attribute float speed;
+                        uniform float uTime;
+                        void main() {
+                            vec3 pos = position;
+                            pos.y -= uTime * 5.0 * speed;
+                            pos.y = mod(pos.y + 50.0, 400.0) - 50.0;
+                            pos.x += sin(uTime * 0.5 + pos.y * 0.05) * 5.0;
+                            pos.z += cos(uTime * 0.3 + pos.y * 0.05) * 5.0;
+                            vec4 mvPosition = modelViewMatrix * vec4(pos, 1.0);
+                            gl_PointSize = size * (300.0 / -mvPosition.z);
+                            gl_Position = projectionMatrix * mvPosition;
+                        }
+                    `,
+                    fragmentShader: `
+                        uniform vec3 color;
+                        uniform float uOpacity;
+                        void main() {
+                            if (length(gl_PointCoord - vec2(0.5)) > 0.5) discard;
+                            gl_FragColor = vec4(color, 0.7 * uOpacity);
+                        }
+                    `,
+                    transparent: true,
+                    depthWrite: false,
+                    blending: THREE.AdditiveBlending
+                });
+                this.petals = new THREE.Points(petalGeo, petalMat);
+                this.scene.add(this.petals);
+
+                const groundPetalCount = 60000; 
+                const gpGeo = new THREE.BufferGeometry();
+                const gpPos = [];
+                const gpDelay = []; 
+                
+                for(let i=0; i<groundPetalCount; i++) {
+                    const r = Math.random() * 250;
+                    const theta = Math.random() * Math.PI * 2;
+                    const x = Math.cos(theta) * r + 20; 
+                    const z = Math.sin(theta) * r;
+                    const y = -34.8 + Math.random() * 0.8; 
+                    gpPos.push(x, y, z);
+                    gpDelay.push(Math.random() * 40.0); 
+                }
+                gpGeo.setAttribute('position', new THREE.Float32BufferAttribute(gpPos, 3));
+                gpGeo.setAttribute('delay', new THREE.Float32BufferAttribute(gpDelay, 1));
+
+                const gpMat = new THREE.ShaderMaterial({
+                    uniforms: {
+                        color: { value: new THREE.Color(COLORS.sakuraPink) },
+                        uTime: { value: 0 },
+                        uOpacity: { value: 1.0 }
+                    },
+                    vertexShader: `
+                        attribute float delay;
+                        uniform float uTime;
+                        varying float vAlpha;
+                        void main() {
+                            vec3 pos = position;
+                            vec4 mvPosition = modelViewMatrix * vec4(pos, 1.0);
+                            gl_PointSize = 4.0 * (100.0 / -mvPosition.z); 
+                            gl_Position = projectionMatrix * mvPosition;
+                            float t = uTime * 2.0; 
+                            vAlpha = smoothstep(delay, delay + 5.0, t);
+                        }
+                    `,
+                    fragmentShader: `
+                        uniform vec3 color;
+                        uniform float uOpacity;
+                        varying float vAlpha;
+                        void main() {
+                            if (length(gl_PointCoord - vec2(0.5)) > 0.5) discard;
+                            gl_FragColor = vec4(color, (vAlpha * 0.8 + 0.2) * uOpacity); 
+                        }
+                    `,
+                    transparent: true,
+                    depthWrite: false
+                });
+                this.groundPetals = new THREE.Points(gpGeo, gpMat);
+                this.scene.add(this.groundPetals);
+
+                const ground = new THREE.Mesh(
+                    new THREE.PlaneGeometry(2000, 2000), 
+                    new THREE.MeshStandardMaterial({ color: 0x010101, roughness: 1.0, metalness: 0.0 })
+                );
+                ground.rotation.x = -Math.PI/2; 
+                ground.position.y = -35.5; 
+                this.scene.add(ground);
+                this.groundMesh = ground; 
+
+                const grassCount = 15000;
+                const grassGeo = new THREE.BufferGeometry();
+                const grassPos = [];
+                const grassColor = [];
+                const grassBase = new THREE.Color(COLORS.grassDark);
+                const grassTip = new THREE.Color(COLORS.grassLight);
+
+                for(let i=0; i<grassCount; i++) {
+                    const r = Math.random() * 200; 
+                    const theta = Math.random() * Math.PI * 2;
+                    const x = Math.cos(theta) * r + 20;
+                    const z = Math.sin(theta) * r;
+                    const y = -35 + Math.random() * 1.5; 
+                    grassPos.push(x, y, z);
+                    const mixColor = grassBase.clone().lerp(grassTip, Math.random());
+                    grassColor.push(mixColor.r, mixColor.g, mixColor.b);
+                }
+                grassGeo.setAttribute('position', new THREE.Float32BufferAttribute(grassPos, 3));
+                grassGeo.setAttribute('color', new THREE.Float32BufferAttribute(grassColor, 3));
+                
+                const grassMat = new THREE.ShaderMaterial({
+                    uniforms: { uTime: { value: 0 }, uOpacity: { value: 1.0 } },
+                    vertexShader: `
+                        attribute vec3 color; varying vec3 vColor; uniform float uTime;
+                        void main() {
+                            vColor = color; vec3 pos = position;
+                            pos.x += sin(uTime * 0.5 + pos.z * 0.1) * 0.3;
+                            vec4 mvPosition = modelViewMatrix * vec4(pos, 1.0);
+                            gl_PointSize = (120.0 / -mvPosition.z); 
+                            gl_Position = projectionMatrix * mvPosition;
+                        }
+                    `,
+                    fragmentShader: `
+                        varying vec3 vColor;
+                        uniform float uOpacity;
+                        void main() {
+                            if (length(gl_PointCoord - vec2(0.5)) > 0.5) discard;
+                            gl_FragColor = vec4(vColor, 0.5 * uOpacity); 
+                        }
+                    `,
+                    transparent: true, depthWrite: false
+                });
+                this.grass = new THREE.Points(grassGeo, grassMat);
+                this.scene.add(this.grass);
+            }
+
+            createFireflies() {
+                this.fireflies = [];
+                const count = 15; 
+                const geometry = new THREE.SphereGeometry(0.15, 8, 8);
+                const material = new THREE.MeshBasicMaterial({ color: 0xaaff55 }); 
+                for(let i=0; i<count; i++) {
+                    const fly = new THREE.Mesh(geometry, material);
+                    fly.add(new THREE.PointLight(0xaaff55, 0.8, 10)); 
+                    fly.position.set((Math.random()-0.5) * 90, -10 + Math.random() * 30, (Math.random()-0.5) * 60);
+                    fly.userData = { speed: 0.2 + Math.random() * 0.3, offset: Math.random() * 100, yBase: fly.position.y, xBase: fly.position.x, zBase: fly.position.z };
+                    this.mainGroup.add(fly); this.fireflies.push(fly);
+                }
+            }
+
+            createSwingAndCat() {
+                this.swingPivot = new THREE.Group();
+                this.swingPivot.position.set(CONFIG.treeOffsetX - 25, -2, 0); 
+                this.mainGroup.add(this.swingPivot);
+                const scale = 2.5; 
+                const ropeLen = 22;
+                
+                const ropeGeo = new THREE.CylinderGeometry(0.04 * scale, 0.04 * scale, ropeLen); 
+                const ropeMat = new THREE.MeshStandardMaterial({color: 0xcd853f, roughness: 0.9}); 
+                const leftRope = new THREE.Mesh(ropeGeo, ropeMat); leftRope.position.set(-1.0 * scale, -ropeLen/2, 0); 
+                const rightRope = new THREE.Mesh(ropeGeo, ropeMat); rightRope.position.set(1.0 * scale, -ropeLen/2, 0); 
+                
+                const seatGeo = new THREE.BoxGeometry(2.8 * scale, 0.2 * scale, 1.4 * scale); 
+                const seatMat = new THREE.MeshStandardMaterial({color: 0x8b4513}); 
+                const seat = new THREE.Mesh(seatGeo, seatMat); seat.position.set(0, -ropeLen, 0);
+
+                // --- RESTORED DETAILED CAT ---
+                const catGroup = new THREE.Group();
+                catGroup.position.set(0, -ropeLen + 0.1 * scale, 0); 
+                catGroup.rotation.y = Math.PI; 
+                
+                // Dimmer cat color (e0e0e0) to avoid blowout
+                const catMat = new THREE.MeshStandardMaterial({
+                    color: 0xe0e0e0, 
+                    roughness: 0.8,  
+                    metalness: 0.1
+                });
+                
+                // 1. Body (Wider at bottom for sitting posture)
+                const body = new THREE.Mesh(new THREE.SphereGeometry(0.85 * scale, 32, 32), catMat);
+                body.position.y = 0.6 * scale;
+                body.scale.set(1.15, 0.9, 1.15); // Squashed and wider
+                
+                // 2. Head (Wider cat face)
+                const head = new THREE.Mesh(new THREE.SphereGeometry(0.75 * scale, 32, 32), catMat);
+                head.position.y = 1.75 * scale;
+                head.scale.set(1.1, 0.95, 1.0); // Slightly wider face
+                head.rotation.y = 0.5; // Turn to moon
+                head.rotation.x = -0.4; // Look up
+
+                // 3. Ears (BIGGER & POINTIER)
+                // Increased size significantly to break the "snowman" silhouette
+                const earGeo = new THREE.ConeGeometry(0.35 * scale, 0.75 * scale, 32); 
+                
+                const leftEar = new THREE.Mesh(earGeo, catMat);
+                leftEar.position.set(0.45 * scale, 0.65 * scale, 0.1 * scale); // Positioned higher and wider
+                leftEar.rotation.z = -0.5; leftEar.rotation.x = -0.1;
+                
+                const rightEar = new THREE.Mesh(earGeo, catMat);
+                rightEar.position.set(-0.45 * scale, 0.65 * scale, 0.1 * scale);
+                rightEar.rotation.z = 0.5; rightEar.rotation.x = -0.1;
+                
+                // Inner Ears (Pink) - Adjusted to match new ears
+                const innerEarGeo = new THREE.ConeGeometry(0.2 * scale, 0.5 * scale, 32);
+                const pinkMat = new THREE.MeshBasicMaterial({color: 0xffb7c5});
+                
+                const leftInner = new THREE.Mesh(innerEarGeo, pinkMat);
+                leftInner.position.set(0.45 * scale, 0.6 * scale, 0.25 * scale); 
+                leftInner.rotation.z = -0.5; leftInner.rotation.x = -0.1;
+                
+                const rightInner = new THREE.Mesh(innerEarGeo, pinkMat);
+                rightInner.position.set(-0.45 * scale, 0.6 * scale, 0.25 * scale);
+                rightInner.rotation.z = 0.5; rightInner.rotation.x = -0.1;
+
+                // 4. Eyes (Black)
+                const eyeGeo = new THREE.SphereGeometry(0.09 * scale, 16, 16);
+                const eyeMat = new THREE.MeshBasicMaterial({color: 0x000000});
+                const leftEye = new THREE.Mesh(eyeGeo, eyeMat);
+                leftEye.position.set(0.3 * scale, 0.1 * scale, 0.65 * scale);
+                const rightEye = new THREE.Mesh(eyeGeo, eyeMat);
+                rightEye.position.set(-0.3 * scale, 0.1 * scale, 0.65 * scale);
+
+                // 5. Nose (Pink)
+                const noseGeo = new THREE.ConeGeometry(0.05 * scale, 0.05 * scale, 16);
+                const nose = new THREE.Mesh(noseGeo, pinkMat);
+                nose.position.set(0, 0, 0.72 * scale); // Slightly further out
+                nose.rotation.x = 1.5;
+
+                // 6. Whiskers
+                const whiskerMat = new THREE.LineBasicMaterial({ color: 0x333333 });
+                const whiskerGroup = new THREE.Group();
+                for(let i=0; i<4; i++) {
+                    const points = [new THREE.Vector3(0.1*scale, 0, 0.7*scale), new THREE.Vector3(0.6*scale, (i-1.5)*0.08*scale, 0.6*scale)]; // Longer whiskers
+                    const geo = new THREE.BufferGeometry().setFromPoints(points);
+                    whiskerGroup.add(new THREE.Line(geo, whiskerMat));
+                    
+                    const points2 = [new THREE.Vector3(-0.1*scale, 0, 0.7*scale), new THREE.Vector3(-0.6*scale, (i-1.5)*0.08*scale, 0.6*scale)];
+                    const geo2 = new THREE.BufferGeometry().setFromPoints(points2);
+                    whiskerGroup.add(new THREE.Line(geo2, whiskerMat));
+                }
+
+                head.add(leftEar); head.add(rightEar); head.add(leftInner); head.add(rightInner);
+                head.add(leftEye); head.add(rightEye); head.add(nose); head.add(whiskerGroup);
+
+                // 7. Tail
+                const curve = new THREE.CatmullRomCurve3([
+                    new THREE.Vector3(0, 0.5 * scale, -0.7 * scale),
+                    new THREE.Vector3(0, -0.2 * scale, -0.9 * scale),
+                    new THREE.Vector3(0.3 * scale, -0.8 * scale, -0.8 * scale),
+                ]);
+                const tailGeo = new THREE.TubeGeometry(curve, 20, 0.12 * scale, 12, false);
+                const tail = new THREE.Mesh(tailGeo, catMat);
+
+                // 8. Paws with Toes
+                const pawGroup = new THREE.Group();
+                const pawGeo = new THREE.SphereGeometry(0.2 * scale, 16, 16);
+                const toeGeo = new THREE.SphereGeometry(0.08 * scale, 8, 8);
+                
+                const createPaw = (x) => {
+                    const g = new THREE.Group();
+                    const main = new THREE.Mesh(pawGeo, catMat);
+                    g.add(main);
+                    // Toes
+                    for(let i=-1; i<=1; i++) {
+                        const toe = new THREE.Mesh(toeGeo, catMat);
+                        toe.position.set(i*0.1*scale, 0, 0.15*scale);
+                        g.add(toe);
+                    }
+                    g.position.set(x, 0.15 * scale, 0.7 * scale); // Lower paws
+                    g.scale.set(1, 0.6, 1);
+                    return g;
+                };
+                
+                pawGroup.add(createPaw(0.35 * scale));
+                pawGroup.add(createPaw(-0.35 * scale));
+
+                catGroup.add(body, head, tail, pawGroup);
+
+                this.swingContent = new THREE.Group();
+                this.swingContent.add(leftRope, rightRope, seat, catGroup);
+                this.swingPivot.add(this.swingContent);
+            }
+
+            createGpuTree() {
+                const geometry = new THREE.BoxGeometry(0.35, 0.35, 0.35); 
+                this.treeMaterial = new THREE.MeshStandardMaterial({ metalness: 0.1, roughness: 0.8, vertexColors: true });
+                
+                this.treeMaterial.onBeforeCompile = (shader) => {
+                    shader.uniforms.uTransition = { value: 0 };
+                    shader.uniforms.uTime = { value: 0 };
+                    shader.vertexShader = `
+                        attribute vec3 posTree;
+                        attribute vec3 posMoon; 
+                        attribute vec3 colorMoon; 
+                        uniform float uTransition;
+                        uniform float uTime;
+                    ` + shader.vertexShader;
+                    shader.vertexShader = shader.vertexShader.replace('#include <color_vertex>', `
+                        #include <color_vertex>
+                        vColor.xyz = mix(color.xyz, colorMoon, uTransition);
+                    `);
+                    shader.vertexShader = shader.vertexShader.replace('#include <begin_vertex>', `
+                        vec3 offset = mix(posTree, posMoon, uTransition);
+                        if(uTransition > 0.5) {
+                            // Moon Float
+                            offset.y += sin(uTime * 0.5 + offset.x * 0.1) * 0.2;
+                        } else {
+                            // Tree Wind
+                            float wind = sin(uTime * 0.5 + offset.x * 0.02 + offset.z * 0.03) * 0.3;
+                            float isLeaf = step(-10.0, offset.y); 
+                            offset.x += wind * isLeaf;
+                            offset.z += cos(uTime * 0.4 + offset.y * 0.05) * 0.2 * isLeaf;
+                        }
+                        vec3 transformed = position + offset;
+                    `);
+                    this.treeMaterial.userData.shader = shader;
+                };
+
+                this.treeMesh = new THREE.InstancedMesh(geometry, this.treeMaterial, CONFIG.particleCount);
+                this.treeMesh.instanceMatrix.setUsage(THREE.StaticDrawUsage); 
+                this.mainGroup.add(this.treeMesh);
+
+                const posTree = new Float32Array(CONFIG.particleCount * 3);
+                const posMoon = new Float32Array(CONFIG.particleCount * 3);
+                const colorsTree = new Float32Array(CONFIG.particleCount * 3);
+                const colorsMoon = new Float32Array(CONFIG.particleCount * 3);
+                const colorObj = new THREE.Color();
+                const colorObj2 = new THREE.Color();
+
+                const trunkCount = Math.floor(CONFIG.particleCount * 0.15); 
+                const rootCount = Math.floor(CONFIG.particleCount * 0.05);
+                const points = [];
+
+                // Tree Structure
+                for(let i=0; i<8; i++) {
+                    const angle = (i / 8) * Math.PI * 2;
+                    for(let j=0; j<15; j++) {
+                        const t = j/15; const dist = 10 + t * 40; const y = -35 + Math.sin(t * Math.PI) * 5 * (1-t) - t*2; 
+                        points.push({x: CONFIG.treeOffsetX + Math.cos(angle) * dist, y: y, z: Math.sin(angle) * dist, r: 8 * (1-t) + 0.5});
+                    }
+                }
+                for(let i=0; i<50; i++) {
+                    const t = i/50; const sway = Math.sin(t * Math.PI * 1.5) * 5;
+                    points.push({x: CONFIG.treeOffsetX + sway, y: -35 + t * 70, z: Math.cos(t * Math.PI) * 3, r: 15 * (1-t*0.6)});
+                }
+                for(let i=0; i<30; i++) {
+                    const t = i/30;
+                    points.push({x: CONFIG.treeOffsetX - t * 40, y: -5 + Math.sin(t * 3) * 2, z: 0 + t * 3, r: 6 * (1-t*0.5)});
+                }
+                const clusters = [];
+                for(let i=0; i<150; i++) {
+                    const theta = Math.random() * Math.PI * 2; const phi = Math.acos(2 * Math.random() - 1); const rad = 30 + Math.random() * 45; 
+                    clusters.push({x: CONFIG.treeOffsetX + rad * Math.sin(phi) * Math.cos(theta), y: 35 + rad * Math.sin(phi) * Math.sin(theta) * 0.7, z: rad * Math.cos(phi), size: 6 + Math.random() * 8});
+                }
+
+                // === TARGET: CENTERED CRESCENT MOON ===
+                const moonCenter = {x: 0, y: 5, z: 0}; 
+
+                for (let i = 0; i < CONFIG.particleCount; i++) {
+                    
+                    // --- 1. TREE STATE ---
+                    if (i < trunkCount + rootCount) {
+                        const p = points[Math.floor(Math.random() * points.length)];
+                        const r = Math.sqrt(Math.random()) * p.r;
+                        const theta = Math.random() * Math.PI * 2;
+                        posTree[i*3] = p.x + r * Math.cos(theta); 
+                        posTree[i*3+1] = p.y + (Math.random()-0.5)*2; 
+                        posTree[i*3+2] = p.z + r * Math.sin(theta);
+                        
+                        if(Math.random() > 0.6) colorObj.setHex(COLORS.brownDark); else colorObj.setHex(COLORS.brownLight);
+                        if (posTree[i*3+1] < -30 && Math.random() > 0.7) colorObj.setHex(COLORS.grassDark);
+                    } else {
+                        const cluster = clusters[Math.floor(Math.random() * clusters.length)];
+                        const r = cluster.size * Math.sqrt(-2*Math.log(Math.random())); 
+                        const theta = 2 * Math.PI * Math.random();
+                        const phi = Math.acos(2 * Math.random() - 1);
+                        posTree[i*3] = cluster.x + r * Math.sin(phi) * Math.cos(theta);
+                        posTree[i*3+1] = cluster.y + r * Math.sin(phi) * Math.sin(theta) * 0.6;
+                        posTree[i*3+2] = cluster.z + r * Math.cos(phi);
+                        
+                        const distNorm = r / (cluster.size * 3);
+                        if (distNorm < 0.25) colorObj.setHex(COLORS.sakuraDeep); 
+                        else if (distNorm < 0.6) colorObj.setHex(COLORS.sakuraPink); 
+                        else colorObj.setHex(COLORS.sakuraWhite);
+                        
+                        if(Math.random() > 0.98) colorObj.setHex(0xffffff); 
+                    }
+                    colorsTree[i*3] = colorObj.r;
+                    colorsTree[i*3+1] = colorObj.g;
+                    colorsTree[i*3+2] = colorObj.b;
+
+                    // --- 2. MOON STATE (Crescent) - IMPROVED ---
+                    let validPoint = false;
+                    let mx, my, mz;
+                    let attempts = 0;
+                    
+                    while(!validPoint && attempts < 50) {
+                        attempts++;
+                        const rx = (Math.random() - 0.5) * 70;
+                        const ry = (Math.random() - 0.5) * 70;
+                        const rz = (Math.random() - 0.5) * 10; 
+                        if (rx*rx + ry*ry < 32*32) {
+                            if ((rx - 14)*(rx - 14) + ry*ry > 28*28) {
+                                mx = rx; my = ry; mz = rz;
+                                validPoint = true;
+                            }
+                        }
+                    }
+                    if(!validPoint) {
+                        mx = 0; my = 0; mz = 0; 
+                    }
+                    
+                    posMoon[i*3] = moonCenter.x + mx;
+                    posMoon[i*3+1] = moonCenter.y + my;
+                    posMoon[i*3+2] = moonCenter.z + mz;
+
+                    // Moon Color
+                    const h = (my + 35) / 70; 
+                    colorObj2.setHex(COLORS.moonWhite);
+                    colorObj2.lerp(new THREE.Color(COLORS.moonGold), h * 0.5 + Math.random()*0.2);
+                    if(Math.random() > 0.9) colorObj2.setHex(COLORS.moonBlue);
+
+                    colorsMoon[i*3] = colorObj2.r;
+                    colorsMoon[i*3+1] = colorObj2.g;
+                    colorsMoon[i*3+2] = colorObj2.b;
+                }
+
+                this.treeMesh.geometry.setAttribute('posTree', new THREE.InstancedBufferAttribute(posTree, 3));
+                this.treeMesh.geometry.setAttribute('posMoon', new THREE.InstancedBufferAttribute(posMoon, 3));
+                this.treeMesh.geometry.setAttribute('color', new THREE.InstancedBufferAttribute(colorsTree, 3));
+                this.treeMesh.geometry.setAttribute('colorMoon', new THREE.InstancedBufferAttribute(colorsMoon, 3));
+            }
+
+            processGestures(results) {
+                if (!results.landmarks || results.landmarks.length === 0) return;
+                const m = results.landmarks[0];
+                const wrist = m[0];
+                const fingers = [[8,5],[12,9],[16,13],[20,17],[4,2]];
+                let extended = 0;
+                fingers.forEach(([t,b]) => { if(Math.hypot(m[t].x-wrist.x, m[t].y-wrist.y) > Math.hypot(m[b].x-wrist.x, m[b].y-wrist.y)*1.2) extended++; });
+                
+                if (extended <= 1) STATE.targetTransition = 0.0;
+                else if (extended >= 4) STATE.targetTransition = 1.0;
+                STATE.mode = STATE.targetTransition === 0.0 ? 'TREE' : 'MOON';
+                
+                const sensitivity = STATE.mode === 'TREE' ? 0.2 : 0.8; 
+                STATE.targetRotation.set((m[9].x - 0.5) * 5.0 * sensitivity, (m[9].y - 0.5) * 3.0 * sensitivity);
+            }
+
+            bindEvents() {
+                window.onresize = () => {
+                    this.camera.aspect = window.innerWidth/window.innerHeight; this.camera.updateProjectionMatrix();
+                    this.renderer.setSize(window.innerWidth, window.innerHeight); this.composer.setSize(window.innerWidth, window.innerHeight);
+                };
+            }
+
+            animate() {
+                requestAnimationFrame(this.animate.bind(this));
+                const time = performance.now() * 0.001;
+
+                if (this.handLandmarker) {
+                    const v = document.getElementById('video-preview');
+                    if (v.readyState >= 2) this.processGestures(this.handLandmarker.detectForVideo(v, performance.now()));
+                }
+
+                STATE.transition = THREE.MathUtils.lerp(STATE.transition, STATE.targetTransition, 0.05);
+                
+                if (this.treeMaterial.userData.shader) {
+                    this.treeMaterial.userData.shader.uniforms.uTransition.value = STATE.transition;
+                    this.treeMaterial.userData.shader.uniforms.uTime.value = time;
+                }
+                
+                const envOpacity = 1.0 - STATE.transition;
+                
+                // Hide Background Moon in Moon Mode
+                if(this.bgMoon) {
+                    const scale = 1.0 - THREE.MathUtils.smoothstep(STATE.transition, 0.0, 0.8);
+                    this.bgMoon.scale.setScalar(scale);
+                    this.bgMoon.visible = scale > 0.01;
+                }
+
+                if(this.petals && this.petals.material.uniforms) {
+                    this.petals.material.uniforms.uTime.value = time;
+                    this.petals.material.uniforms.uOpacity.value = envOpacity;
+                }
+                if(this.grass && this.grass.material.uniforms) {
+                    this.grass.material.uniforms.uTime.value = time;
+                    this.grass.material.uniforms.uOpacity.value = envOpacity;
+                }
+                if(this.groundPetals && this.groundPetals.material.uniforms) {
+                    this.groundPetals.material.uniforms.uTime.value = time;
+                    this.groundPetals.material.uniforms.uOpacity.value = envOpacity;
+                }
+                
+                // Hide Swing Mesh completely
+                if(this.swingPivot) {
+                    this.swingPivot.rotation.x = Math.sin(time * 0.8) * 0.1; 
+                    const swingScale = 1.0 - THREE.MathUtils.smoothstep(STATE.transition, 0.0, 0.5);
+                    this.swingPivot.scale.setScalar(swingScale);
+                    this.swingPivot.visible = swingScale > 0.01;
+                }
+                
+                // Fade fireflies
+                if(this.fireflies) {
+                    this.fireflies.forEach(fly => {
+                        const t = time * fly.userData.speed + fly.userData.offset;
+                        fly.position.x = fly.userData.xBase + Math.sin(t) * 10.0; 
+                        fly.position.y = fly.userData.yBase + Math.sin(t * 1.5) * 3.0;
+                        fly.position.z = fly.userData.zBase + Math.cos(t * 0.8) * 10.0;
+                        fly.children[0].intensity = (1.5 + Math.sin(t * 5) * 0.5) * envOpacity;
+                        fly.visible = envOpacity > 0.01;
+                    });
+                }
+
+                STATE.rotation.lerp(STATE.targetRotation, 0.1); 
+                
+                this.mainGroup.rotation.y = 0.44 + STATE.rotation.x; 
+                this.mainGroup.rotation.x = STATE.rotation.y * 0.5;
+
+                this.composer.render();
+            }
+        }
+        window.onload = () => new App();
+    </script>
+</body>
+</html>
